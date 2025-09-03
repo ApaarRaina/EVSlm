@@ -5,16 +5,20 @@ import numpy as np
 import evaluate
 from datasets import Dataset
 
-
+# Load dataset
 with open("qa_dataset.json", "r", encoding="utf-8") as f:
     qa_data = json.load(f)
 
-texts = [f"Question: {item['instruction']} Answer: {item['response']}" for item in qa_data]
+texts = [f"Question: {item['instruction']} Answer: {item['response']} <END>" for item in qa_data]
 
 dataset = Dataset.from_dict({"text": texts})
 
 checkpoint = "HuggingFaceTB/SmolLM2-360M"
 tokenizer = AutoTokenizer.from_pretrained(checkpoint)
+
+# Add <END> if not present
+if "<END>" not in tokenizer.get_vocab():
+    tokenizer.add_special_tokens({'additional_special_tokens': ["<END>"]})
 
 if tokenizer.pad_token is None:
     tokenizer.add_special_tokens({'pad_token': '[PAD]'})
@@ -35,19 +39,9 @@ def tokenize_function(examples):
     )
 
 tokenized_dataset = dataset.map(tokenize_function, batched=True)
+tokenized_dataset = tokenized_dataset.map(lambda batch: {"labels": batch["input_ids"]}, batched=True)
 
-tokenized_dataset = tokenized_dataset.map(
-    lambda batch: {"labels": batch["input_ids"]},
-    batched=True
-)
-
-metric = evaluate.load("accuracy")
-
-def compute_metrics(eval_pred):
-    logits, labels = eval_pred
-    predictions = np.argmax(logits, axis=-1)
-    return metric.compute(predictions=predictions, references=labels)
-
+# Train args
 training_args = TrainingArguments(
     output_dir="output",
     push_to_hub=False,
@@ -56,20 +50,19 @@ training_args = TrainingArguments(
     learning_rate=0.0005
 )
 
-# 8. Trainer
 trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=tokenized_dataset,
     compute_metrics=None
 )
-
-
 trainer.train()
 
+# Save fine-tuned model
 model.save_pretrained("qa_model")
 tokenizer.save_pretrained("qa_model")
 
+# Load pipeline
 qa_pipeline = pipeline(
     "text-generation",
     model="qa_model",
@@ -77,11 +70,29 @@ qa_pipeline = pipeline(
     device=0 if torch.cuda.is_available() else -1
 )
 
+# Interactive Q&A loop
+conversation_history = ""   # keep conversation separate
+
 while True:
     user_q = input("Ask a question (or type 'quit' to exit): ")
     if user_q.lower() == "quit":
         break
 
-    prompt = f"Question:{user_q} Answer:"
-    output = qa_pipeline(prompt, max_length=100, do_sample=True, top_p=0.9, temperature=0.7,repetition_penalty=1.2,eos_token_id=tokenizer.eos_token_id)
-    print("Model:", output[0]["generated_text"])
+    # Append conversation
+    conversation_history += f"\nQuestion: {user_q} Answer:"
+
+    output = qa_pipeline(
+        conversation_history,
+        max_new_tokens=50,
+        do_sample=True,
+        top_p=0.9,
+        temperature=0.7,
+        repetition_penalty=1.2,
+        eos_token_id=tokenizer.convert_tokens_to_ids("<END>")
+    )
+
+    answer = output[0]["generated_text"]
+    print("Model:", answer)
+
+    # Update history with model answer (without <END>)
+    conversation_history += " " + answer.replace("<END>", "").strip()
